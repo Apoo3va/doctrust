@@ -1,0 +1,15 @@
+crewai
+groq
+chromadb
+sentence-transformers
+pydantic
+pypdf
+python-dotenv
+pandas
+markdown
+ragas
+opentelemetry-api
+opentelemetry-sdk
+fastapi
+uvicorn
+streamlit
