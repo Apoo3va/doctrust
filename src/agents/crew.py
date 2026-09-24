@@ -130,7 +130,7 @@ def run_query(query: str) -> dict:
 
 
 if __name__ == "__main__":
-    query = "What is the HR leave policy?"
+    query = "My email is john.doe@example.com, what is the leave policy?"
     print(f"\nRunning DocTrust pipeline for: {query!r}\n")
     result = run_query(query)
 
