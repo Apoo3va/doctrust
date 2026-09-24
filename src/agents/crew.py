@@ -1,23 +1,26 @@
 """
 crew.py
 Defines the DocTrust multi-agent pipeline:
-  Retriever Agent -> Synthesizer Agent -> Validator Agent
+  Retriever Agent -> Synthesizer Agent -> Validator Agent -> Guardrails
 Run with: python src/agents/crew.py
 """
 
 import os
+import json
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process
 
 from tools import DocumentRetrieverTool
 from patches import apply_patch
 
+sys.path.append(str(Path(__file__).resolve().parents[1] / "guardrails"))
+from guardrails import apply_guardrails
+
 load_dotenv()
 apply_patch()
 
-# LiteLLM (used internally by CrewAI) reads GROQ_API_KEY from the environment automatically.
-# Using a stronger model here since synthesis/validation benefit from better reasoning
-# than the small model we used for entity extraction.
 LLM_MODEL = "groq/openai/gpt-oss-120b"
 
 retriever_tool = DocumentRetrieverTool()
@@ -57,7 +60,16 @@ validator_agent = Agent(
 )
 
 
-def run_query(query: str):
+def _parse_json_output(raw_text: str) -> dict:
+    """Best-effort parse of a task's raw text output into a JSON dict."""
+    cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {}
+
+
+def run_query(query: str) -> dict:
     retrieve_task = Task(
         description=(
             f"Search the knowledge base for content relevant to this question: '{query}'. "
@@ -100,12 +112,30 @@ def run_query(query: str):
         verbose=True,
     )
 
-    return crew.kickoff()
+    crew.kickoff()
+
+    synthesized = _parse_json_output(synthesize_task.output.raw)
+    validation = _parse_json_output(validate_task.output.raw)
+
+    guard_result = apply_guardrails(query, synthesized, validation)
+
+    return {
+        "query": query,
+        "synthesized": synthesized,
+        "validation": validation,
+        "guardrail_allowed": guard_result.allowed,
+        "guardrail_reason": guard_result.reason,
+        "final_answer": guard_result.final_answer,
+    }
 
 
 if __name__ == "__main__":
     query = "What is the HR leave policy?"
     print(f"\nRunning DocTrust pipeline for: {query!r}\n")
     result = run_query(query)
-    print("\n=== FINAL OUTPUT ===")
-    print(result)
+
+    print("\n=== FINAL RESULT ===")
+    print(f"Allowed: {result['guardrail_allowed']}")
+    if result["guardrail_reason"]:
+        print(f"Guardrail reason: {result['guardrail_reason']}")
+    print(f"\nFinal answer:\n{result['final_answer']}")
