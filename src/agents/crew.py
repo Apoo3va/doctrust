@@ -17,6 +17,7 @@ from patches import apply_patch
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "guardrails"))
 from guardrails import apply_guardrails
+from pii import detect_pii
 
 load_dotenv()
 apply_patch()
@@ -70,6 +71,20 @@ def _parse_json_output(raw_text: str) -> dict:
 
 
 def run_query(query: str) -> dict:
+    # Fail fast: check the raw query for PII before running the (expensive) crew at all
+    query_pii = detect_pii(query)
+    if query_pii:
+        return {
+            "query": query,
+            "synthesized": {},
+            "validation": {},
+            "guardrail_allowed": False,
+            "guardrail_reason": f"Query contains personal information ({', '.join(query_pii)}).",
+            "final_answer": (
+                "I can't process questions that include personal information like "
+                "emails, phone numbers, or ID numbers. Please rephrase without that data."
+            ),
+        }
     retrieve_task = Task(
         description=(
             f"Search the knowledge base for content relevant to this question: '{query}'. "
