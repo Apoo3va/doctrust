@@ -2,64 +2,72 @@
 crew.py
 Defines the DocTrust multi-agent pipeline:
   Retriever Agent -> Synthesizer Agent -> Validator Agent -> Guardrails
+Instrumented with OpenTelemetry tracing and cost-aware model routing.
 Run with: python src/agents/crew.py
 """
 
 import os
 import json
 import sys
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process
 
 from tools import DocumentRetrieverTool
 from patches import apply_patch
+from model_router import choose_model
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "guardrails"))
+sys.path.append(str(Path(__file__).resolve().parents[1] / "observability"))
 from guardrails import apply_guardrails
 from pii import detect_pii
+from tracing import traced_span, log_query_metrics
 
 load_dotenv()
 apply_patch()
 
-LLM_MODEL = "groq/openai/gpt-oss-20b"
-
 retriever_tool = DocumentRetrieverTool()
 
-retriever_agent = Agent(
-    role="Document Retriever",
-    goal="Find the most relevant document chunks in DocTrust's knowledge base to answer the user's question",
-    backstory=(
-        "You are an expert at searching enterprise documents across PDFs, wikis, "
-        "and structured records to find exactly the right context for a question."
-    ),
-    tools=[retriever_tool],
-    llm=LLM_MODEL,
-    max_iter=1,
-    verbose=True,
-)
 
-synthesizer_agent = Agent(
-    role="Answer Synthesizer",
-    goal="Draft a clear, accurate answer strictly grounded in the retrieved context, with citations",
-    backstory=(
-        "You are a careful writer who never states anything not explicitly supported "
-        "by the provided context, and always cites your sources by name."
-    ),
-    llm=LLM_MODEL,
-    verbose=True,
-)
+def build_agents(model: str):
+    """Builds fresh agent instances using the given model (cheap or strong)."""
+    retriever_agent = Agent(
+        role="Document Retriever",
+        goal="Find the most relevant document chunks in DocTrust's knowledge base to answer the user's question",
+        backstory=(
+            "You are an expert at searching enterprise documents across PDFs, wikis, "
+            "and structured records to find exactly the right context for a question."
+        ),
+        tools=[retriever_tool],
+        llm=model,
+        max_iter=1,
+        verbose=True,
+    )
 
-validator_agent = Agent(
-    role="Answer Validator",
-    goal="Check whether the drafted answer is fully supported by the retrieved context, flagging any unsupported claims",
-    backstory=(
-        "You are a skeptical fact-checker who cross-references every claim in an "
-        "answer against the source context before approving it."
-    ),
-    llm=LLM_MODEL,
-    verbose=True,
-)
+    synthesizer_agent = Agent(
+        role="Answer Synthesizer",
+        goal="Draft a clear, accurate answer strictly grounded in the retrieved context, with citations",
+        backstory=(
+            "You are a careful writer who never states anything not explicitly supported "
+            "by the provided context, and always cites your sources by name."
+        ),
+        llm=model,
+        verbose=True,
+    )
+
+    validator_agent = Agent(
+        role="Answer Validator",
+        goal="Check whether the drafted answer is fully supported by the retrieved context, flagging any unsupported claims",
+        backstory=(
+            "You are a skeptical fact-checker who cross-references every claim in an "
+            "answer against the source context before approving it."
+        ),
+        llm=model,
+        verbose=True,
+    )
+
+    return retriever_agent, synthesizer_agent, validator_agent
 
 
 def _parse_json_output(raw_text: str) -> dict:
@@ -72,6 +80,8 @@ def _parse_json_output(raw_text: str) -> dict:
 
 
 def run_query(query: str) -> dict:
+    start_time = time.time()
+
     # Fail fast: check the raw query for PII before running the (expensive) crew at all
     query_pii = detect_pii(query)
     if query_pii:
@@ -86,15 +96,23 @@ def run_query(query: str) -> dict:
                 "emails, phone numbers, or ID numbers. Please rephrase without that data."
             ),
         }
-    retrieve_task = Task(
-    description=(
-        f"Call the document_retriever tool EXACTLY ONCE with this exact question as the query: "
-        f"'{query}'. Do not reword the query or call the tool more than once, even if the "
-        "results seem imperfect. Return whatever the tool gives you."
-    ),
-    expected_output="The retrieved document chunks with their source names, departments, and categories.",
-    agent=retriever_agent,
-)
+
+    # Cost-aware model routing: pick cheap or strong model based on query complexity
+    model = choose_model(query)
+    print(f"[model_router] Using model: {model}")
+
+    retriever_agent, synthesizer_agent, validator_agent = build_agents(model)
+
+    with traced_span("retrieve_task", query=query, model=model):
+        retrieve_task = Task(
+            description=(
+                f"Call the document_retriever tool EXACTLY ONCE with this exact question as the query: "
+                f"'{query}'. Do not reword the query or call the tool more than once, even if the "
+                "results seem imperfect. Return whatever the tool gives you."
+            ),
+            expected_output="The retrieved document chunks with their source names, departments, and categories.",
+            agent=retriever_agent,
+        )
 
     synthesize_task = Task(
         description=(
@@ -129,12 +147,34 @@ def run_query(query: str) -> dict:
         verbose=True,
     )
 
-    crew.kickoff()
+    with traced_span("crew_pipeline", query=query, model=model):
+        crew.kickoff()
 
     synthesized = _parse_json_output(synthesize_task.output.raw)
     validation = _parse_json_output(validate_task.output.raw)
 
     guard_result = apply_guardrails(query, synthesized, validation)
+
+    total_latency = time.time() - start_time
+
+    # Pull token usage from CrewAI's usage metrics if available
+    prompt_tokens = 0
+    completion_tokens = 0
+    try:
+        usage = crew.usage_metrics
+        prompt_tokens = getattr(usage, "prompt_tokens", 0)
+        completion_tokens = getattr(usage, "completion_tokens", 0)
+    except Exception:
+        pass
+
+    log_query_metrics(
+        query=query,
+        model=model,
+        latency=total_latency,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        allowed=guard_result.allowed,
+    )
 
     return {
         "query": query,
