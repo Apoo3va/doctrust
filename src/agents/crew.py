@@ -22,7 +22,7 @@ from pii import detect_pii
 load_dotenv()
 apply_patch()
 
-LLM_MODEL = "groq/openai/gpt-oss-120b"
+LLM_MODEL = "groq/openai/gpt-oss-20b"
 
 retriever_tool = DocumentRetrieverTool()
 
@@ -35,6 +35,7 @@ retriever_agent = Agent(
     ),
     tools=[retriever_tool],
     llm=LLM_MODEL,
+    max_iter=1,
     verbose=True,
 )
 
@@ -86,13 +87,14 @@ def run_query(query: str) -> dict:
             ),
         }
     retrieve_task = Task(
-        description=(
-            f"Search the knowledge base for content relevant to this question: '{query}'. "
-            "Use the document_retriever tool. Return the retrieved chunks with their sources."
-        ),
-        expected_output="The retrieved document chunks with their source names, departments, and categories.",
-        agent=retriever_agent,
-    )
+    description=(
+        f"Call the document_retriever tool EXACTLY ONCE with this exact question as the query: "
+        f"'{query}'. Do not reword the query or call the tool more than once, even if the "
+        "results seem imperfect. Return whatever the tool gives you."
+    ),
+    expected_output="The retrieved document chunks with their source names, departments, and categories.",
+    agent=retriever_agent,
+)
 
     synthesize_task = Task(
         description=(
