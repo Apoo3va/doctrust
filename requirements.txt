@@ -17,3 +17,4 @@ litellm
 langchain-groq
 langchain-huggingface
 langchain-community<0.4.2
+pytest
