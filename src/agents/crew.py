@@ -1,8 +1,8 @@
 """
 crew.py
 Defines the DocTrust multi-agent pipeline:
-  Retriever Agent -> Synthesizer Agent -> Validator Agent -> Guardrails
-Instrumented with OpenTelemetry tracing and cost-aware model routing.
+  Semantic Cache -> Retriever Agent -> Synthesizer Agent -> Validator Agent -> Guardrails
+Instrumented with OpenTelemetry tracing, cost-aware model routing, and semantic caching.
 Run with: python src/agents/crew.py
 """
 
@@ -23,6 +23,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "observability"))
 from guardrails import apply_guardrails
 from pii import detect_pii
 from tracing import traced_span, log_query_metrics
+from semantic_cache import get_cached_answer, store_cached_answer
 
 load_dotenv()
 apply_patch()
@@ -96,6 +97,11 @@ def run_query(query: str) -> dict:
                 "emails, phone numbers, or ID numbers. Please rephrase without that data."
             ),
         }
+
+    # Check semantic cache before running the expensive pipeline
+    cached = get_cached_answer(query)
+    if cached is not None:
+        return cached
 
     # Cost-aware model routing: pick cheap or strong model based on query complexity
     model = choose_model(query)
@@ -176,7 +182,7 @@ def run_query(query: str) -> dict:
         allowed=guard_result.allowed,
     )
 
-    return {
+    result = {
         "query": query,
         "synthesized": synthesized,
         "validation": validation,
@@ -184,6 +190,12 @@ def run_query(query: str) -> dict:
         "guardrail_reason": guard_result.reason,
         "final_answer": guard_result.final_answer,
     }
+
+    # Only cache answers that passed guardrails, so we never serve a cached refusal as if it were a real answer
+    if guard_result.allowed:
+        store_cached_answer(query, result)
+
+    return result
 
 
 if __name__ == "__main__":
