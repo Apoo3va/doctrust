@@ -1,7 +1,8 @@
 """
 api.py
 FastAPI wrapper exposing DocTrust's multi-agent RAG pipeline as an HTTP API.
-Protected by a simple API key header for the /query endpoint.
+Protected by a simple API key header. Includes a /feedback loop for tracking
+answer helpfulness over time.
 Run with: uvicorn src.api:app --reload
 """
 
@@ -18,6 +19,7 @@ sys.path.append(str(Path(__file__).resolve().parent / "agents"))
 sys.path.append(str(Path(__file__).resolve().parent / "observability"))
 from crew import run_query
 from logger import get_logger
+from feedback import store_feedback, get_feedback_summary
 
 load_dotenv()
 log = get_logger("api")
@@ -61,6 +63,18 @@ class QueryResponse(BaseModel):
     citations: list[str] = []
 
 
+class FeedbackRequest(BaseModel):
+    query: str
+    answer: str
+    helpful: bool
+    comment: str = ""
+
+
+class FeedbackResponse(BaseModel):
+    feedback_id: str
+    message: str
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -78,6 +92,23 @@ def query_endpoint(request: QueryRequest, api_key: str = Security(verify_api_key
         confidence=result.get("synthesized", {}).get("confidence"),
         citations=result.get("synthesized", {}).get("citations", []),
     )
+
+
+@app.post("/feedback", response_model=FeedbackResponse)
+def feedback_endpoint(request: FeedbackRequest, api_key: str = Security(verify_api_key)):
+    feedback_id = store_feedback(
+        query=request.query,
+        answer=request.answer,
+        helpful=request.helpful,
+        comment=request.comment,
+    )
+    log.info(f"Feedback received: helpful={request.helpful} id={feedback_id}")
+    return FeedbackResponse(feedback_id=feedback_id, message="Feedback recorded. Thank you.")
+
+
+@app.get("/feedback/summary")
+def feedback_summary_endpoint(api_key: str = Security(verify_api_key)):
+    return get_feedback_summary()
 
 
 if __name__ == "__main__":
