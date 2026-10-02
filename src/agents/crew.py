@@ -2,7 +2,8 @@
 crew.py
 Defines the DocTrust multi-agent pipeline:
   Semantic Cache -> Retriever Agent -> Synthesizer Agent -> Validator Agent -> Guardrails
-Instrumented with OpenTelemetry tracing, cost-aware model routing, and semantic caching.
+Instrumented with OpenTelemetry tracing, cost-aware model routing, semantic caching,
+and structured logging.
 Run with: python src/agents/crew.py
 """
 
@@ -24,9 +25,12 @@ from guardrails import apply_guardrails
 from pii import detect_pii
 from tracing import traced_span, log_query_metrics
 from semantic_cache import get_cached_answer, store_cached_answer
+from logger import get_logger
 
 load_dotenv()
 apply_patch()
+
+log = get_logger("crew")
 
 retriever_tool = DocumentRetrieverTool()
 
@@ -77,15 +81,18 @@ def _parse_json_output(raw_text: str) -> dict:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
+        log.warning(f"Failed to parse JSON output from agent: {cleaned[:200]!r}")
         return {}
 
 
 def run_query(query: str) -> dict:
     start_time = time.time()
+    log.info(f"Received query: {query!r}")
 
     # Fail fast: check the raw query for PII before running the (expensive) crew at all
     query_pii = detect_pii(query)
     if query_pii:
+        log.warning(f"Query blocked for PII ({', '.join(query_pii)}): {query!r}")
         return {
             "query": query,
             "synthesized": {},
@@ -101,11 +108,12 @@ def run_query(query: str) -> dict:
     # Check semantic cache before running the expensive pipeline
     cached = get_cached_answer(query)
     if cached is not None:
+        log.info(f"Served from semantic cache: {query!r}")
         return cached
 
     # Cost-aware model routing: pick cheap or strong model based on query complexity
     model = choose_model(query)
-    print(f"[model_router] Using model: {model}")
+    log.info(f"Model router selected: {model}")
 
     retriever_agent, synthesizer_agent, validator_agent = build_agents(model)
 
@@ -153,13 +161,20 @@ def run_query(query: str) -> dict:
         verbose=True,
     )
 
+    log.info("Starting crew execution")
     with traced_span("crew_pipeline", query=query, model=model):
         crew.kickoff()
+    log.info("Crew execution completed")
 
     synthesized = _parse_json_output(synthesize_task.output.raw)
     validation = _parse_json_output(validate_task.output.raw)
 
     guard_result = apply_guardrails(query, synthesized, validation)
+
+    if not guard_result.allowed:
+        log.warning(f"Guardrail blocked answer: {guard_result.reason}")
+    else:
+        log.info(f"Guardrail passed. Confidence={synthesized.get('confidence')}")
 
     total_latency = time.time() - start_time
 
@@ -170,8 +185,8 @@ def run_query(query: str) -> dict:
         usage = crew.usage_metrics
         prompt_tokens = getattr(usage, "prompt_tokens", 0)
         completion_tokens = getattr(usage, "completion_tokens", 0)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"Could not read usage_metrics: {e}")
 
     log_query_metrics(
         query=query,
@@ -181,6 +196,8 @@ def run_query(query: str) -> dict:
         completion_tokens=completion_tokens,
         allowed=guard_result.allowed,
     )
+
+    log.info(f"Query completed in {total_latency:.2f}s")
 
     result = {
         "query": query,
@@ -200,7 +217,7 @@ def run_query(query: str) -> dict:
 
 if __name__ == "__main__":
     query = "What is the HR leave policy?"
-    print(f"\nRunning DocTrust pipeline for: {query!r}\n")
+    log.info(f"Running DocTrust pipeline for: {query!r}")
     result = run_query(query)
 
     print("\n=== FINAL RESULT ===")
