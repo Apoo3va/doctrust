@@ -1,6 +1,7 @@
 """
 chat_app.py
 A Streamlit chat interface for DocTrust, calling the FastAPI backend.
+Supports multi-turn conversations by sending prior Q&A history with each request.
 Run with: streamlit run src/chat_app.py
 (Make sure `uvicorn src.api:app` is running separately on port 8000 first.)
 """
@@ -21,6 +22,20 @@ st.caption("Enterprise RAG Copilot with Guardrails & Observability")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+
+def build_history() -> list[dict]:
+    """Builds a list of {query, answer} pairs from the session's chat history."""
+    history = []
+    pending_query = None
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
+            pending_query = msg["content"]
+        elif msg["role"] == "assistant" and pending_query is not None:
+            history.append({"query": pending_query, "answer": msg["content"]})
+            pending_query = None
+    return history
+
 
 # --- Render chat history ---
 for msg in st.session_state.messages:
@@ -69,13 +84,15 @@ if prompt := st.chat_input("Ask a question about company policies..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    history = build_history()
+
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 response = requests.post(
                     f"{API_URL}/query",
                     headers={"X-API-Key": API_KEY},
-                    json={"query": prompt},
+                    json={"query": prompt, "history": history},
                     timeout=120,
                 )
                 if response.status_code == 200:

@@ -1,8 +1,8 @@
 """
 api.py
 FastAPI wrapper exposing DocTrust's multi-agent RAG pipeline as an HTTP API.
-Protected by a simple API key header. Includes a /feedback loop for tracking
-answer helpfulness over time.
+Protected by a simple API key header. Includes a /feedback loop and supports
+multi-turn conversation history for natural follow-up questions.
 Run with: uvicorn src.api:app --reload
 """
 
@@ -50,8 +50,14 @@ def verify_api_key(provided_key: str = Security(api_key_header)):
     return provided_key
 
 
+class ConversationTurn(BaseModel):
+    query: str
+    answer: str
+
+
 class QueryRequest(BaseModel):
     query: str
+    history: list[ConversationTurn] = []
 
 
 class QueryResponse(BaseModel):
@@ -82,7 +88,8 @@ def health_check():
 
 @app.post("/query", response_model=QueryResponse)
 def query_endpoint(request: QueryRequest, api_key: str = Security(verify_api_key)):
-    result = run_query(request.query)
+    history_dicts = [turn.model_dump() for turn in request.history]
+    result = run_query(request.query, history=history_dicts)
 
     return QueryResponse(
         query=result["query"],
