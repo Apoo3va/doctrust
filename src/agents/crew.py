@@ -3,16 +3,14 @@ crew.py
 Defines the DocTrust multi-agent pipeline:
   Semantic Cache -> Retriever Agent -> Synthesizer Agent -> Validator Agent -> Guardrails
 Instrumented with OpenTelemetry tracing, cost-aware model routing, semantic caching,
-structured logging, and multi-turn conversation memory via query contextualization.
+and structured logging. Supports multi-turn conversation memory via query contextualization.
 Run with: python src/agents/crew.py
 """
-
 import os
 import json
 import sys
 import time
 from pathlib import Path
-
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process
 
@@ -23,13 +21,11 @@ from contextualizer import contextualize_query
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "guardrails"))
 sys.path.append(str(Path(__file__).resolve().parents[1] / "observability"))
-
 from guardrails import apply_guardrails
 from pii import detect_pii
 from tracing import traced_span, log_query_metrics
 from semantic_cache import get_cached_answer, store_cached_answer
 from logger import get_logger
-
 
 load_dotenv()
 apply_patch()
@@ -40,33 +36,28 @@ retriever_tool = DocumentRetrieverTool()
 
 
 def build_agents(model: str):
-    """Builds fresh agent instances using the given model (cheap or strong)."""
-
     retriever_agent = Agent(
         role="Document Retriever",
-        goal=(
-            "Find the most relevant document chunks in DocTrust's knowledge base "
-            "to answer the user's question"
-        ),
+        goal="Retrieve the most relevant document chunks for a given question.",
         backstory=(
-            "You are an expert at searching enterprise documents across PDFs, wikis, "
-            "and structured records to find exactly the right context for a question."
+            "You are a precise retrieval specialist. You call the document_retriever "
+            "tool exactly once with the user's question and return whatever it gives you, "
+            "without rewording the query or second-guessing the results."
         ),
         tools=[retriever_tool],
         llm=model,
-        max_iter=1,
+        max_iter=2,
         verbose=True,
     )
 
     synthesizer_agent = Agent(
         role="Answer Synthesizer",
-        goal=(
-            "Draft a clear, accurate answer strictly grounded in the retrieved "
-            "context, with citations"
-        ),
+        goal="Write a clear, accurate answer using only the retrieved context.",
         backstory=(
-            "You are a careful writer who never states anything not explicitly "
-            "supported by the provided context, and always cites your sources by name."
+            "You are a careful technical writer. You never add information that isn't "
+            "present in the retrieved context, and you always cite your sources. You "
+            "estimate your own confidence honestly based on how directly the context "
+            "supports your answer."
         ),
         llm=model,
         verbose=True,
@@ -74,13 +65,11 @@ def build_agents(model: str):
 
     validator_agent = Agent(
         role="Answer Validator",
-        goal=(
-            "Check whether the drafted answer is fully supported by the retrieved "
-            "context, flagging any unsupported claims"
-        ),
+        goal="Check whether the synthesized answer is fully grounded in the retrieved context.",
         backstory=(
-            "You are a skeptical fact-checker who cross-references every claim in an "
-            "answer against the source context before approving it."
+            "You are a skeptical fact-checker. You flag any claim in the answer that "
+            "isn't directly supported by the retrieved context, and you are not afraid "
+            "to fail an answer that sounds plausible but isn't backed by evidence."
         ),
         llm=model,
         verbose=True,
@@ -90,216 +79,116 @@ def build_agents(model: str):
 
 
 def _parse_json_output(raw_text: str) -> dict:
-    """Best-effort parse of a task's raw text output into a JSON dict."""
-
-    cleaned = (
-        raw_text
-        .strip()
-        .replace("```json", "")
-        .replace("```", "")
-        .strip()
-    )
-
+    cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        log.warning(
-            f"Failed to parse JSON output from agent: {cleaned[:200]!r}"
-        )
+        log.warning(f"Failed to parse JSON output from agent: {cleaned[:200]!r}")
         return {}
 
 
 def run_query(query: str, history: list[dict] | None = None) -> dict:
     start_time = time.time()
     history = history or []
-
-    log.info(
-        f"Received query: {query!r} "
-        f"(history_turns={len(history)})"
-    )
+    log.info(f"Received query: {query!r} (history_turns={len(history)})")
 
     original_query = query
-
-    # Contextualize follow-up questions when conversation history exists
     if history:
         query = contextualize_query(query, history)
-
         if query != original_query:
-            log.info(
-                f"Contextualized follow-up: "
-                f"{original_query!r} -> {query!r}"
-            )
+            log.info(f"Contextualized follow-up: {original_query!r} -> {query!r}")
 
-    # Fail fast: check the raw query for PII before running
-    # the expensive crew at all
+    # Fail fast: PII check before expensive crew execution
     query_pii = detect_pii(query)
-
     if query_pii:
-        log.warning(
-            f"Query blocked for PII "
-            f"({', '.join(query_pii)}): {query!r}"
-        )
-
+        log.warning(f"Blocked query containing PII types: {query_pii}")
         return {
             "query": original_query,
             "synthesized": {},
             "validation": {},
             "guardrail_allowed": False,
-            "guardrail_reason": (
-                f"Query contains personal information "
-                f"({', '.join(query_pii)})."
-            ),
+            "guardrail_reason": f"Query contains PII: {query_pii}",
             "final_answer": (
-                "I can't process questions that include personal information "
-                "like emails, phone numbers, or ID numbers. "
-                "Please rephrase without that data."
+                "I can't process questions that include personal information like "
+                "emails, phone numbers, or ID numbers. Please rephrase without that data."
             ),
         }
 
-    # Check semantic cache before running the expensive pipeline.
-    # Skip caching for multi-turn queries because a cached single-turn
-    # answer may not fit the conversational context.
+    # Semantic cache (skipped when history present)
     if not history:
         cached = get_cached_answer(query)
-
         if cached is not None:
-            log.info(
-                f"Served from semantic cache: {query!r}"
-            )
+            log.info(f"Served from semantic cache: {query!r}")
             return cached
 
-    # Cost-aware model routing: pick cheap or strong model
-    # based on query complexity
     model = choose_model(query)
-
-    log.info(
-        f"Model router selected: {model}"
-    )
-
+    log.info(f"Model router selected: {model}")
     retriever_agent, synthesizer_agent, validator_agent = build_agents(model)
 
-    # ---------------------------------------------------------
-    # RETRIEVER TASK
-    # ---------------------------------------------------------
-
-    with traced_span(
-        "retrieve_task",
-        query=query,
-        model=model,
-    ):
+    with traced_span("retrieve_task", query=query, model=model):
         retrieve_task = Task(
             description=(
-                f"Call the document_retriever tool EXACTLY ONCE "
-                f"with this exact question as the query: "
-                f"'{query}'. "
-                "Do not reword the query or call the tool more than once, "
-                "even if the results seem imperfect. "
-                "Return whatever the tool gives you."
+                f"Call the document_retriever tool EXACTLY ONCE with this exact question "
+                f"as the query: '{query}'. Do not reword the query or call the tool more "
+                f"than once, even if the results seem imperfect. Return whatever the tool "
+                f"gives you."
             ),
-            expected_output=(
-                "The retrieved document chunks with their source names, "
-                "departments, and categories."
-            ),
+            expected_output="The raw retrieved document chunks returned by the tool.",
             agent=retriever_agent,
         )
 
-    # ---------------------------------------------------------
-    # SYNTHESIZER TASK
-    # ---------------------------------------------------------
-
     synthesize_task = Task(
         description=(
-            f"Using ONLY the retrieved context from the previous task, "
-            f"answer this question: '{query}'. "
-            "Do not use any outside knowledge or make anything up. "
-            "If the context does not contain enough information to answer, "
-            "say so explicitly instead of guessing.\n\n"
-            "Respond ONLY with a valid JSON object in this exact format, "
-            "nothing else:\n"
-            '{"answer": "...", '
-            '"citations": ["source_name_1", "source_name_2"], '
-            '"confidence": 0.0}'
+            f"Using ONLY the retrieved context from the previous task, answer this "
+            f"question: '{query}'. Do not use any outside knowledge. If the context does "
+            f"not contain enough information to answer, say so honestly instead of "
+            f"guessing. Cite the source of each fact you use (file name or section). "
+            f"Respond ONLY with a valid JSON object in this exact format, no extra text "
+            f"before or after it: "
+            f'{{"answer": "...", "citations": ["..."], "confidence": 0.0}} '
+            f"where confidence is a number between 0.0 and 1.0 reflecting how directly "
+            f"the retrieved context supports your answer."
         ),
-        expected_output=(
-            'A JSON object with "answer", "citations", '
-            'and "confidence" fields.'
-        ),
-        agent=synthesizer_agent,
+        expected_output="A JSON object with answer, citations, and confidence fields.",
         context=[retrieve_task],
+        agent=synthesizer_agent,
     )
-
-    # ---------------------------------------------------------
-    # VALIDATOR TASK
-    # ---------------------------------------------------------
 
     validate_task = Task(
         description=(
-            "Review the synthesized answer from the previous task "
-            "against the originally retrieved context. "
-            "Check whether every claim in the answer is actually "
-            "supported by the context. "
-            "Be skeptical -- flag anything that seems inferred "
-            "or not explicitly stated.\n\n"
-            "Respond ONLY with a valid JSON object in this exact format, "
-            "nothing else:\n"
-            '{"grounded": true, "issues": [], "verdict": "pass"}'
+            "Review the synthesized answer from the previous task against the retrieved "
+            "context. Check whether every claim in the answer is directly supported by "
+            "the context. Respond ONLY with a valid JSON object in this exact format, no "
+            "extra text before or after it: "
+            '{"grounded": true, "issues": [], "verdict": "pass"} '
+            "where verdict is either 'pass' or 'fail', and issues is a list of strings "
+            "describing any unsupported claims (empty list if none)."
         ),
-        expected_output=(
-            'A JSON object with "grounded", "issues", '
-            'and "verdict" fields.'
-        ),
-        agent=validator_agent,
+        expected_output="A JSON object with grounded, issues, and verdict fields.",
         context=[retrieve_task, synthesize_task],
+        agent=validator_agent,
     )
 
-    # ---------------------------------------------------------
-    # CREW
-    # ---------------------------------------------------------
-
     crew = Crew(
-        agents=[
-            retriever_agent,
-            synthesizer_agent,
-            validator_agent,
-        ],
-        tasks=[
-            retrieve_task,
-            synthesize_task,
-            validate_task,
-        ],
+        agents=[retriever_agent, synthesizer_agent, validator_agent],
+        tasks=[retrieve_task, synthesize_task, validate_task],
         process=Process.sequential,
         verbose=True,
     )
 
-    # FIXED: correct indentation
     log.info("Starting crew execution")
-
     try:
-        with traced_span(
-            "crew_pipeline",
-            query=query,
-            model=model,
-        ):
+        with traced_span("crew_pipeline", query=query, model=model):
             crew.kickoff()
-
         log.info("Crew execution completed")
-
     except Exception as e:
-        log.error(
-            f"Crew execution failed: {e}"
-        )
-
+        log.error(f"Crew execution failed: {e}")
         error_message = (
-            "The system is currently handling a high volume of requests "
-            "and hit a rate limit. Please wait a moment and try again."
-        ) if (
-            "rate_limit" in str(e).lower()
-            or "RateLimitError" in str(e)
-        ) else (
-            "Something went wrong while processing your question. "
-            "Please try again."
+            "The system is currently handling a high volume of requests and hit a rate "
+            "limit. Please wait a moment and try again."
+        ) if "rate_limit" in str(e).lower() or "RateLimitError" in str(e) else (
+            "Something went wrong while processing your question. Please try again."
         )
-
         return {
             "query": original_query,
             "synthesized": {},
@@ -309,68 +198,17 @@ def run_query(query: str, history: list[dict] | None = None) -> dict:
             "final_answer": error_message,
         }
 
-    # ---------------------------------------------------------
-    # PARSE AGENT OUTPUT
-    # ---------------------------------------------------------
-
-    synthesized = _parse_json_output(
-        synthesize_task.output.raw
-    )
-
-    validation = _parse_json_output(
-        validate_task.output.raw
-    )
-
-    # ---------------------------------------------------------
-    # GUARDRAILS
-    # ---------------------------------------------------------
-
-    guard_result = apply_guardrails(
-        query,
-        synthesized,
-        validation,
-    )
-
-    if not guard_result.allowed:
-        log.warning(
-            f"Guardrail blocked answer: "
-            f"{guard_result.reason}"
-        )
-    else:
-        log.info(
-            f"Guardrail passed. "
-            f"Confidence={synthesized.get('confidence')}"
-        )
-
-    # ---------------------------------------------------------
-    # METRICS
-    # ---------------------------------------------------------
+    synthesized = _parse_json_output(synthesize_task.output.raw)
+    validation = _parse_json_output(validate_task.output.raw)
+    log.info(f"Synthesized output: {synthesized}")
+    log.info(f"Validation output: {validation}")
+    guard_result = apply_guardrails(query, synthesized, validation)
 
     total_latency = time.time() - start_time
 
-    # Pull token usage from CrewAI's usage metrics if available
-    prompt_tokens = 0
-    completion_tokens = 0
-
-    try:
-        usage = crew.usage_metrics
-
-        prompt_tokens = getattr(
-            usage,
-            "prompt_tokens",
-            0,
-        )
-
-        completion_tokens = getattr(
-            usage,
-            "completion_tokens",
-            0,
-        )
-
-    except Exception as e:
-        log.debug(
-            f"Could not read usage_metrics: {e}"
-        )
+    usage = getattr(crew, "usage_metrics", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
 
     log_query_metrics(
         query=query,
@@ -380,14 +218,7 @@ def run_query(query: str, history: list[dict] | None = None) -> dict:
         completion_tokens=completion_tokens,
         allowed=guard_result.allowed,
     )
-
-    log.info(
-        f"Query completed in {total_latency:.2f}s"
-    )
-
-    # ---------------------------------------------------------
-    # FINAL RESULT
-    # ---------------------------------------------------------
+    log.info(f"Query completed in {total_latency:.2f}s")
 
     result = {
         "query": original_query,
@@ -397,42 +228,17 @@ def run_query(query: str, history: list[dict] | None = None) -> dict:
         "guardrail_reason": guard_result.reason,
         "final_answer": guard_result.final_answer,
     }
-
-    # Only cache single-turn answers that passed guardrails
     if guard_result.allowed and not history:
-        store_cached_answer(
-            query,
-            result,
-        )
-
+        store_cached_answer(query, result)
     return result
 
 
-# -------------------------------------------------------------
-# DIRECT EXECUTION
-# -------------------------------------------------------------
-
 if __name__ == "__main__":
     query = "What is the HR leave policy?"
-
-    log.info(
-        f"Running DocTrust pipeline for: {query!r}"
-    )
-
+    log.info(f"Running DocTrust pipeline for: {query!r}")
     result = run_query(query)
-
     print("\n=== FINAL RESULT ===")
-    print(
-        f"Allowed: {result['guardrail_allowed']}"
-    )
-
+    print(f"Allowed: {result['guardrail_allowed']}")
     if result["guardrail_reason"]:
-        print(
-            f"Guardrail reason: "
-            f"{result['guardrail_reason']}"
-        )
-
-    print(
-        f"\nFinal answer:\n"
-        f"{result['final_answer']}"
-    )
+        print(f"Guardrail reason: {result['guardrail_reason']}")
+    print(f"\nFinal answer:\n{result['final_answer']}")
